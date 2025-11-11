@@ -75,7 +75,7 @@ void setup()
   Serial.print("\nWiFi connected with IP: ");
   Serial.println(WiFi.localIP());
 
-  myGNSS.setUART1Output(COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3); //UBX+RTCM3 is not a valid option so we enable all three.
+  myGNSS.setUART2Output(COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3); //UBX+RTCM3 is not a valid option so we enable all three.
 
   myGNSS.setNavigationFrequency(1); //Set output in Hz. RTCM rarely benefits from >1Hz.
 
@@ -164,7 +164,7 @@ void loop()
 void beginServing()
 {
   //Serial.println("Begin transmitting to caster. Press any key to stop");
-  delay(10); //Wait for any serial to arrive
+  //delay(10); //Wait for any serial to arrive
   //while (Serial.available())
     //Serial.read(); //Flush
 
