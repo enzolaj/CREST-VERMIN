@@ -1,6 +1,6 @@
 //Your WiFi credentials
-const char *ssid = "OLIN-DEVICES";
-const char *password = "BestOval4Engineers!";
+const char *ssid = "OLIN-ROBOTICS";
+const char *password = "R0B0TS-RULE";
 
 //RTK2Go works well and is free
 //const char casterHost[] = "rtk2go.com";
