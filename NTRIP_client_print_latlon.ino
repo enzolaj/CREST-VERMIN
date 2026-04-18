@@ -1,0 +1,409 @@
+/*
+  Use ESP32 WiFi to get RTCM data from RTK2Go (caster) as a Client
+  By: SparkFun Electronics / Nathan Seidle
+  Date: November 18th, 2021
+  License: MIT. See license file for more information but you can
+  basically do whatever you want with this code.
+
+  This example shows how to obtain RTCM data from a NTRIP Caster over WiFi
+  and push it over I2C to a ZED-F9x.
+  It's confusing, but the Arduino is acting as a 'client' to a 'caster'. In this case we will
+  use RTK2Go.com as our caster because it is free. See the NTRIPServer example to see how
+  to push RTCM data to the caster.
+
+  You will need to have a valid mountpoint available. To see available mountpoints go here: http://rtk2go.com:2101/
+
+  This is a proof of concept to show how to connect to a caster via HTTP. Using WiFi for a rover
+  is generally a bad idea because of limited WiFi range in the field.
+
+  For more information about NTRIP Clients and the differences between Rev1 and Rev2 of the protocol
+  please see: https://www.use-snip.com/kb/knowledge-base/ntrip-rev1-versus-rev2-formats/
+
+  Feel like supporting open source hardware?
+  Buy a board from SparkFun!
+  ZED-F9P RTK2: https://www.sparkfun.com/products/16481
+  RTK Surveyor: https://www.sparkfun.com/products/18443
+  RTK Express: https://www.sparkfun.com/products/18442
+
+  Hardware Connections:
+  Plug a Qwiic cable into the GNSS and a ESP32 Thing Plus
+  If you don't have a platform with a Qwiic connection use the SparkFun Qwiic Breadboard Jumper (https://www.sparkfun.com/products/14425)
+  Open the serial monitor at 115200 baud to see the output
+*/
+#include <WiFi.h>
+#include "secrets.h"
+
+#include <SparkFun_u-blox_GNSS_v3.h> //http://librarymanager/All#SparkFun_u-blox_GNSS
+SFE_UBLOX_GNSS_SERIAL myGNSS;
+
+//The ESP32 core has a built in base64 library but not every platform does
+//We'll use an external lib if necessary.
+#if defined(ARDUINO_ARCH_ESP32)
+#include "base64.h" //Built-in ESP32 library
+#else
+#include <Base64.h> //nfriendly library from https://github.com/adamvr/arduino-base64, will work with any platform
+#endif
+
+//Global variables
+//=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+long lastReceivedRTCM_ms = 0; //5 RTCM messages take approximately ~300ms to arrive at 115200bps
+int maxTimeBeforeHangup_ms = 10000; //If we fail to get a complete RTCM frame after 10s, then disconnect from caster
+//=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+HardwareSerial GNSS_Serial(2);  // Use UART2 on ESP32
+
+void setup()
+{
+  Serial.begin(115200);
+  GNSS_Serial.begin(38400, SERIAL_8N1, 16, 17); // ZED-F9P on UART2
+  Serial.println(F("NTRIP testing"));
+  //myGNSS.enableDebugging(Serial);
+  if (!myGNSS.begin(GNSS_Serial)) //Connect to the u-blox module using Wire port
+  {
+    Serial.println(F("u-blox GNSS not detected on UART. Please check wiring. Freezing."));
+    while (1);
+
+  }
+  Serial.println(F("u-blox module connected"));
+
+  myGNSS.newCfgValset(VAL_LAYER_RAM);
+
+  myGNSS.addCfgValset8(UBLOX_CFG_UART2INPROT_UBX, 1);     // Enable UBX input
+  myGNSS.addCfgValset8(UBLOX_CFG_UART2INPROT_RTCM3X, 1);  // Enable RTCM3 input (correct name is RTCM3X)
+  myGNSS.addCfgValset8(UBLOX_CFG_UART2INPROT_NMEA, 0);    // Disable NMEA input
+
+  myGNSS.addCfgValset8(UBLOX_CFG_UART2OUTPROT_UBX, 1);    // Enable UBX output
+  myGNSS.addCfgValset8(UBLOX_CFG_UART2OUTPROT_NMEA, 0);   // Disable NMEA output
+
+  myGNSS.sendCfgValset();
+  //myGNSS.setNMEAOutputPort(SFE_UBLOX_GNSS::COM_PORT_UART2, SFE_UBLOX_GNSS::NMEA_GGA);
+
+  myGNSS.setNavigationFrequency(1); //Set output in Hz.
+  byte rate;
+  if(myGNSS.getNavigationFrequency(&rate)) //Get the update rate of this module
+  {
+    Serial.print("Current update rate: ");
+    Serial.println(rate);
+  }
+  else
+  {
+    Serial.println("getNavigationFrequency failed!");
+  }
+  Serial.print(F("Connecting to local WiFi"));
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(F("."));
+  }
+  Serial.println();
+
+  Serial.print(F("WiFi connected with IP: "));
+  Serial.println(WiFi.localIP());
+
+  while (Serial.available()) Serial.read();
+}
+
+void loop()
+{
+  //if (Serial.available())
+  //{
+    //beginClient();
+    //while (Serial.available()) Serial.read(); //Empty buffer of any newline chars
+  //}
+
+  //Serial.println(F("Press any key to start NTRIP Client."));
+  beginClient();
+  delay(1000);
+}
+
+//Connect to NTRIP Caster, receive RTCM, and push to ZED module over I2C
+void beginClient()
+{
+  WiFiClient ntripClient;
+  long rtcmCount = 0;
+
+  //Serial.println(F("Subscribing to Caster. Press key to stop"));
+  //delay(10); //Wait for any serial to arrive
+  //while (Serial.available()) Serial.read(); //Flush
+
+  while (Serial.available() == 0)
+  {
+    //Connect if we are not already. Limit to 5s between attempts.
+    if (ntripClient.connected() == false)
+    {
+      Serial.print(F("Opening socket to "));
+      Serial.println(casterHost);
+
+      if (ntripClient.connect(casterHost, casterPort) == false) //Attempt connection
+      {
+        Serial.println(F("Connection to caster failed"));
+        return;
+      }
+      else
+      {
+        Serial.print(F("Connected to "));
+        Serial.print(casterHost);
+        Serial.print(F(": "));
+        Serial.println(casterPort);
+
+        Serial.print(F("Requesting NTRIP Data from mount point "));
+        Serial.println(mountPoint);
+
+        const int SERVER_BUFFER_SIZE  = 512;
+        char serverRequest[SERVER_BUFFER_SIZE];
+
+        snprintf(serverRequest, SERVER_BUFFER_SIZE, "GET /%s HTTP/1.0\r\nUser-Agent: NTRIP SparkFun u-blox Client v1.0\r\n",
+                 mountPoint);
+
+        char credentials[512];
+        if (strlen(casterUser) == 0)
+        {
+          strncpy(credentials, "Accept: */*\r\nConnection: close\r\n", sizeof(credentials));
+        }
+        else
+        {
+          //Pass base64 encoded user:pw
+          char userCredentials[sizeof(casterUser) + sizeof(casterUserPW) + 1]; //The ':' takes up a spot
+          snprintf(userCredentials, sizeof(userCredentials), "%s:%s", casterUser, casterUserPW);
+
+          Serial.print(F("Sending credentials: "));
+          Serial.println(userCredentials);
+
+#if defined(ARDUINO_ARCH_ESP32)
+          //Encode with ESP32 built-in library
+          base64 b;
+          String strEncodedCredentials = b.encode(userCredentials);
+          char encodedCredentials[strEncodedCredentials.length() + 1];
+          strEncodedCredentials.toCharArray(encodedCredentials, sizeof(encodedCredentials)); //Convert String to char array
+          snprintf(credentials, sizeof(credentials), "Authorization: Basic %s\r\n", encodedCredentials);
+#else
+          //Encode with nfriendly library
+          int encodedLen = base64_enc_len(strlen(userCredentials));
+          char encodedCredentials[encodedLen]; //Create array large enough to house encoded data
+          base64_encode(encodedCredentials, userCredentials, strlen(userCredentials)); //Note: Input array is consumed
+#endif
+        }
+        strncat(serverRequest, credentials, SERVER_BUFFER_SIZE);
+        strncat(serverRequest, "\r\n", SERVER_BUFFER_SIZE);
+
+        Serial.print(F("serverRequest size: "));
+        Serial.print(strlen(serverRequest));
+        Serial.print(F(" of "));
+        Serial.print(sizeof(serverRequest));
+        Serial.println(F(" bytes available"));
+
+        Serial.println(F("Sending server request:"));
+        Serial.println(serverRequest);
+        ntripClient.write(serverRequest, strlen(serverRequest));
+
+        //Wait for response
+        unsigned long timeout = millis();
+        while (ntripClient.available() == 0)
+        {
+          if (millis() - timeout > 5000)
+          {
+            Serial.println(F("Caster timed out!"));
+            ntripClient.stop();
+            return;
+          }
+          delay(10);
+        }
+
+        //Check reply
+        bool connectionSuccess = false;
+        char response[512];
+        int responseSpot = 0;
+        while (ntripClient.available())
+        {
+          if (responseSpot == sizeof(response) - 1) break;
+
+          response[responseSpot++] = ntripClient.read();
+          if (strstr(response, "200") != nullptr) //Look for 'ICY 200 OK'
+            connectionSuccess = true;
+          if (strstr(response, "401") != nullptr) //Look for '401 Unauthorized'
+          {
+            Serial.println(F("Hey - your credentials look bad! Check you caster username and password."));
+            connectionSuccess = false;
+          }
+        }
+        response[responseSpot] = '\0';
+
+        Serial.print(F("Caster responded with: "));
+        Serial.println(response);
+
+        if (connectionSuccess == false)
+        {
+          Serial.print(F("Failed to connect to "));
+          Serial.print(casterHost);
+          Serial.print(F(": "));
+          Serial.println(response);
+          return;
+        }
+        else
+        {
+          Serial.print(F("Connected to "));
+          Serial.println(casterHost);
+          lastReceivedRTCM_ms = millis(); //Reset timeout
+        }
+      } //End attempt to connect
+    } //End connected == false
+
+    if (ntripClient.connected() == true)
+    {
+      uint8_t rtcmData[512 * 4]; //Most incoming data is around 500 bytes but may be larger
+      rtcmCount = 0;
+
+      //Print any available RTCM data
+      while (ntripClient.available())
+      {
+        //Serial.write(ntripClient.read()); //Pipe to serial port is fine but beware, it's a lot of binary data
+        rtcmData[rtcmCount++] = ntripClient.read();
+        if (rtcmCount == sizeof(rtcmData)) break;
+      }
+
+      if (rtcmCount > 0)
+      {
+        lastReceivedRTCM_ms = millis();
+
+        //Push RTCM to GNSS module over I2C
+        myGNSS.pushRawData(rtcmData, rtcmCount, false);
+        //Serial.print(F("RTCM pushed to ZED: "));
+        //Serial.println(rtcmCount);
+        getPos();
+      }
+    }
+
+    //Close socket if we don't have new data for 10s
+    if (millis() - lastReceivedRTCM_ms > maxTimeBeforeHangup_ms)
+    {
+      Serial.println(F("RTCM timeout. Disconnecting..."));
+      if (ntripClient.connected() == true)
+        ntripClient.stop();
+      return;
+    }
+
+    delay(10);
+  }
+
+  //Serial.println(F("User pressed a key"));
+  //Serial.println(F("Disconnecting..."));
+  ntripClient.stop();
+}
+
+void getPos()
+{
+  if (myGNSS.getHPPOSLLH())
+  {
+    // getHighResLatitude: returns the latitude from HPPOSLLH as an int32_t in degrees * 10^-7
+    // getHighResLatitudeHp: returns the high resolution component of latitude from HPPOSLLH as an int8_t in degrees * 10^-9
+    // getHighResLongitude: returns the longitude from HPPOSLLH as an int32_t in degrees * 10^-7
+    // getHighResLongitudeHp: returns the high resolution component of longitude from HPPOSLLH as an int8_t in degrees * 10^-9
+    // getElipsoid: returns the height above ellipsoid as an int32_t in mm
+    // getElipsoidHp: returns the high resolution component of the height above ellipsoid as an int8_t in mm * 10^-1
+    // getMeanSeaLevel: returns the height above mean sea level as an int32_t in mm
+    // getMeanSeaLevelHp: returns the high resolution component of the height above mean sea level as an int8_t in mm * 10^-1
+    // getHorizontalAccuracy: returns the horizontal accuracy estimate from HPPOSLLH as an uint32_t in mm * 10^-1
+
+    // If you want to use the high precision latitude and longitude with the full 9 decimal places
+    // you will need to use a 64-bit double - which is not supported on all platforms
+
+    // To allow this example to run on standard platforms, we cheat by converting lat and lon to integer and fractional degrees
+
+    // The high resolution altitudes can be converted into standard 32-bit float
+
+    // First, let's collect the position data
+    int32_t latitude = myGNSS.getHighResLatitude();
+    int8_t latitudeHp = myGNSS.getHighResLatitudeHp();
+    int32_t longitude = myGNSS.getHighResLongitude();
+    int8_t longitudeHp = myGNSS.getHighResLongitudeHp();
+    int32_t ellipsoid = myGNSS.getElipsoid();
+    int8_t ellipsoidHp = myGNSS.getElipsoidHp();
+    int32_t msl = myGNSS.getMeanSeaLevel();
+    int8_t mslHp = myGNSS.getMeanSeaLevelHp();
+    uint32_t accuracy = myGNSS.getHorizontalAccuracy();
+
+    // Defines storage for the lat and lon units integer and fractional parts
+    int32_t lat_int; // Integer part of the latitude in degrees
+    int32_t lat_frac; // Fractional part of the latitude
+    int32_t lon_int; // Integer part of the longitude in degrees
+    int32_t lon_frac; // Fractional part of the longitude
+
+    // Calculate the latitude and longitude integer and fractional parts
+    lat_int = latitude / 10000000; // Convert latitude from degrees * 10^-7 to Degrees
+    lat_frac = latitude - (lat_int * 10000000); // Calculate the fractional part of the latitude
+    lat_frac = (lat_frac * 100) + latitudeHp; // Now add the high resolution component
+    if (lat_frac < 0) // If the fractional part is negative, remove the minus sign
+    {
+      lat_frac = 0 - lat_frac;
+    }
+    lon_int = longitude / 10000000; // Convert latitude from degrees * 10^-7 to Degrees
+    lon_frac = longitude - (lon_int * 10000000); // Calculate the fractional part of the longitude
+    lon_frac = (lon_frac * 100) + longitudeHp; // Now add the high resolution component
+    if (lon_frac < 0) // If the fractional part is negative, remove the minus sign
+    {
+      lon_frac = 0 - lon_frac;
+    }
+    //lat lon, ellipsoid, mean sea level, accuracy
+    // Print the lat and lon
+    //Serial.print("Lat (deg): ");
+    Serial.print(lat_int); // Print the integer part of the latitude
+    Serial.print(".");
+    printFractional(lat_frac, 9); // Print the fractional part of the latitude with leading zeros
+    Serial.print(" ");
+
+    //Serial.print(", Lon (deg): ");
+    Serial.print(lon_int); // Print the integer part of the latitude
+    Serial.print(".");
+    printFractional(lon_frac, 9); // Print the fractional part of the latitude with leading zeros
+    Serial.print(" ");
+
+    //Serial.println();
+
+    // Now define float storage for the heights and accuracy
+    float f_ellipsoid;
+    float f_msl;
+    float f_accuracy;
+
+    // Calculate the height above ellipsoid in mm * 10^-1
+    f_ellipsoid = (ellipsoid * 10) + ellipsoidHp;
+    // Now convert to m
+    f_ellipsoid = f_ellipsoid / 10000.0; // Convert from mm * 10^-1 to m
+
+    // Calculate the height above mean sea level in mm * 10^-1
+    f_msl = (msl * 10) + mslHp;
+    // Now convert to m
+    f_msl = f_msl / 10000.0; // Convert from mm * 10^-1 to m
+
+    // Convert the horizontal accuracy (mm * 10^-1) to a float
+    f_accuracy = accuracy;
+    // Now convert to m
+    f_accuracy = f_accuracy / 10000.0; // Convert from mm * 10^-1 to m
+
+    // Finally, do the printing
+    //Serial.print("Ellipsoid (m): ");
+    Serial.print(f_ellipsoid, 4); // Print the ellipsoid with 4 decimal places
+    Serial.print(" ");
+    //Serial.print(", Mean Sea Level(m): ");
+    Serial.print(f_msl, 4); // Print the mean sea level with 4 decimal places
+    Serial.print(" ");
+    //Serial.print(", Accuracy (m): ");
+    Serial.println(f_accuracy, 4); // Print the accuracy with 4 decimal places
+    Serial.print(" ");
+  }
+}
+
+// Pretty-print the fractional part with leading zeros - without using printf
+// (Only works with positive numbers)
+void printFractional(int32_t fractional, uint8_t places)
+{
+  if (places > 1)
+  {
+    for (uint8_t place = places - 1; place > 0; place--)
+    {
+      if (fractional < pow(10, place))
+      {
+        Serial.print("0");
+      }
+    }
+  }
+  Serial.print(fractional);
+}
