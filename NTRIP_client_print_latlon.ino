@@ -54,7 +54,7 @@ HardwareSerial GNSS_Serial(2);  // Use UART2 on ESP32
 void setup()
 {
   Serial.begin(115200);
-  GNSS_Serial.begin(38400, SERIAL_8N1, 16, 17); // ZED-F9P on UART2
+  GNSS_Serial.begin(115200, SERIAL_8N1, 16, 17); // ZED-F9P on UART2
   Serial.println(F("NTRIP testing"));
   //myGNSS.enableDebugging(Serial);
   if (!myGNSS.begin(GNSS_Serial)) //Connect to the u-blox module using Wire port
